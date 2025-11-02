@@ -75,6 +75,7 @@ class SceneDataset(Dataset):
         node_mat = torch.from_numpy(data["node_data"].astype(np.float32))
         line_mat = torch.from_numpy(data["line_data"].astype(np.float32))
         adj_mat = torch.from_numpy(data["topology_matrix"].astype(np.float32))
+        node_count = node_mat.shape[0]
 
         # 构建掩码（示例逻辑，可根据实际需求调整）
         a = node_mat.shape[0]
@@ -85,7 +86,8 @@ class SceneDataset(Dataset):
             "line_matrix": line_mat,
             "adj_matrix": adj_mat,
             "mask": mask,
-            "scene_idx": scene_idx
+            "scene_idx": scene_idx,
+            "node_count": node_count
         }
 
 
