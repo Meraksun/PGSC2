@@ -86,9 +86,13 @@ class GTransformerPretrain(nn.Module):
             local_feat = layer["dympn"](node_feat=x, adj=adj, node_count=node_count)
 
             # 2.3 GraphMultiHeadAttention：捕捉全局拓扑依赖
-            # 注意力掩码：从node_feat的掩码推导（非0即非掩码，0为掩码）
-            # 掩码逻辑：节点特征中电压列（2、3列）为0 → 该节点需屏蔽注意力
-            mask = (node_feat[:, :, 2:4] == 0).any(dim=-1, keepdim=True)  # (B, N, 1)
+            # 1. 生成布尔型掩码（显式转换）
+            mask = (node_feat[:, :, 2:4] == 0).any(dim=-1, keepdim=True).bool()  # (B, N, 1)，确保是bool类型
+            # 2. 扩展维度以匹配注意力分数的形状 (B, n_heads, N, N)
+            # 插入注意力头数维度（第1维），并重复适配节点数
+            mask = mask.unsqueeze(1)  # 形状变为 (B, 1, N, 1)
+            mask = mask.repeat(1, 1, 1, local_feat.size(1))  # 变为 (B, 1, N, N)，仍为bool类型
+            # 3. 传入注意力层
             global_feat = layer["gatt"](h=local_feat, mask=mask, node_count=node_count)
 
             # 2.4 残差连接 + 层归一化
