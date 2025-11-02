@@ -1,214 +1,99 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from typing import Optional, Dict, List
-from torch.utils.data import DataLoader
-from tqdm import tqdm  # 用于训练进度可视化（可选，提升体验）
+from torch.utils.data import Dataset, DataLoader
+from typing import List, Dict, Tuple
+import numpy as np
+import os
 
-# 导入自定义模块（需确保各模块路径正确）
-from gnn_layers import DyMPNLayer, GraphMultiHeadAttention
-from physics_loss import PhysicsInformedLoss
-
-
-class GTransformerPretrain(nn.Module):
+class SceneDataset(Dataset):
     """
-    基于论文的Graph Transformer预训练模型（PPGT简化版）
-    核心结构：堆叠"DyMPN局部特征提取 + GraphMultiHeadAttention全局依赖捕捉"层
-    适配20-50节点辐射型配电网，聚焦掩码电压预测任务（🔶1-20、🔶1-22、🔶1-75）
+    配电网场景数据集（适配20-50节点辐射型网络）
+    每个场景包含：节点特征矩阵、线路特征矩阵、邻接矩阵
     """
+    def __init__(self, data_root: str):
+        self.data_root = data_root
+        self.scene_files = [f for f in os.listdir(data_root) if f.startswith("Sence_") and f.endswith(".npy")]
+        self.scene_files.sort(key=lambda x: int(x.split("_")[1].split(".")[0]))  # 按场景编号排序
 
-    def __init__(
-            self,
-            d_in: int = 4,
-            d_model: int = 64,
-            n_heads: int = 4,
-            n_layers: int = 2
-    ):
+    def __len__(self) -> int:
+        return len(self.scene_files)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """加载单个场景数据，返回节点矩阵、线路矩阵、邻接矩阵和场景编号"""
+        scene_file = self.scene_files[idx]
+        scene_path = os.path.join(self.data_root, scene_file)
+        data = np.load(scene_path, allow_pickle=False)
+        node_matrix, line_matrix, adj_matrix = data[0], data[1], data[2]
+
+        # 转换为Tensor
+        return {
+            "node_matrix": torch.FloatTensor(node_matrix),
+            "line_matrix": torch.FloatTensor(line_matrix),
+            "adj_matrix": torch.FloatTensor(adj_matrix),
+            "scene_idx": torch.tensor(int(scene_file.split("_")[1].split(".")[0]), dtype=torch.long),
+            # 新增：当前场景的真实节点数（节点矩阵的行数）
+            "node_count": torch.tensor(node_matrix.shape[0], dtype=torch.long)
+        }
+
+def get_data_loader(
+        data_root: str = "./Dataset",
+        dataset: Dataset = None,
+        batch_size: int = 8,
+        shuffle: bool = True,
+        num_workers: int = 2
+) -> DataLoader:
+    """获取数据集加载器，支持自定义collate_fn处理变长节点数"""
+    if dataset is None:
+        dataset = SceneDataset(data_root)
+
+    def _collate_fn(batch: List[Dict]) -> Dict:
         """
-        初始化GTransformer预训练模型
-
-        Args:
-            d_in: 输入节点特征维度（默认4，对应P_load、Q_load、V、θ标幺值）
-            d_model: 嵌入/中间特征维度（默认64，与DyMPN、注意力层一致）
-            n_heads: 注意力头数（默认4，需满足d_model % n_heads == 0，适配小节点）
-            n_layers: GTransformer堆叠层数（默认2，小节点规模无需深层结构）
+        自定义Batch拼接函数：处理不同节点数的场景，用0填充至Batch内最大节点数
+        新增：计算每个场景的真实节点数并添加到batch中
         """
-        super().__init__()
-        self.d_model = d_model
-        self.n_layers = n_layers
+        max_nodes = max(item["node_matrix"].shape[0] for item in batch)
+        max_lines = max(item["line_matrix"].shape[0] for item in batch)
 
-        # 1. 输入嵌入层：将原始4维特征映射到d_model维（与DyMPN输入匹配）
-        self.input_embed = nn.Linear(d_in, d_model)
+        node_matrix_batch = []
+        line_matrix_batch = []
+        adj_matrix_batch = []
+        scene_idx_batch = []
+        node_count_batch = []  # 存储每个场景的真实节点数
 
-        # 2. 堆叠GTransformer层：每层=DyMPN + GraphMultiHeadAttention + 残差连接 + 层归一化
-        self.gtransformer_layers = nn.ModuleList()
-        for _ in range(n_layers):
-            dympn = DyMPNLayer(d_in=d_model, d_model=d_model)  # DyMPN输入为d_model（嵌入后特征）
-            gatt = GraphMultiHeadAttention(d_model=d_model, n_heads=n_heads)
-            norm = nn.LayerNorm(d_model)  # 层归一化（论文中用于稳定训练，🔶1-72）
-            self.gtransformer_layers.append(nn.ModuleDict({
-                "dympn": dympn,
-                "gatt": gatt,
-                "norm": norm
-            }))
+        for item in batch:
+            a = item["node_matrix"].shape[0]  # 真实节点数（当前场景）
+            b = item["line_matrix"].shape[0]
 
-        # 3. 节点特征预测头：输出完整节点特征（P_load、Q_load、V、θ，4维）
-        # 论文中预训练目标为"补全掩码特征"，此处直接预测所有节点特征（🔶1-78）
-        self.node_pred_head = nn.Linear(d_model, 4)
+            # 节点矩阵填充
+            node_pad = torch.zeros(max_nodes, 4, dtype=item["node_matrix"].dtype)
+            node_pad[:a] = item["node_matrix"]
+            node_matrix_batch.append(node_pad)
 
-    def forward(
-            self,
-            node_feat: torch.Tensor,
-            adj: torch.Tensor,
-            node_count: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        前向传播：从带掩码的节点特征预测完整节点特征
+            # 线路矩阵填充
+            line_pad = torch.zeros(max_lines, 4, dtype=item["line_matrix"].dtype)
+            line_pad[:b] = item["line_matrix"]
+            line_matrix_batch.append(line_pad)
 
-        Args:
-            node_feat: 带掩码的输入节点特征（B, N, d_in），B=Batch，N=最大节点数
-            adj: 拓扑邻接矩阵（B, N, N）
-            node_count: 每个场景的真实节点数（B, ）
+            # 邻接矩阵填充
+            adj_pad = torch.zeros(max_nodes, max_nodes, dtype=item["adj_matrix"].dtype)
+            adj_pad[:a, :a] = item["adj_matrix"]
+            adj_matrix_batch.append(adj_pad)
 
-        Returns:
-            pred_node: 预测的完整节点特征（B, N, 4）
-        """
-        # 步骤1：输入特征嵌入（d_in→d_model）
-        # 形状变化：(B, N, d_in) → (B, N, d_model)
-        x = self.input_embed(node_feat)
+            # 收集场景编号和真实节点数
+            scene_idx_batch.append(item["scene_idx"])
+            node_count_batch.append(a)  # 记录当前场景的真实节点数
 
-        # 步骤2：经过n_layers层GTransformer
-        for layer in self.gtransformer_layers:
-            # 2.1 残差连接备份（论文中用于缓解梯度消失，🔶1-72）
-            residual = x
+        return {
+            "node_matrix": torch.stack(node_matrix_batch),
+            "line_matrix": torch.stack(line_matrix_batch),
+            "adj_matrix": torch.stack(adj_matrix_batch),
+            "scene_idx": torch.tensor(scene_idx_batch, dtype=torch.long),
+            "node_count": torch.tensor(node_count_batch, dtype=torch.long)  # 新增：真实节点数
+        }
 
-            # 2.2 DyMPN：提取局部拓扑特征
-            local_feat = layer["dympn"](node_feat=x, adj=adj, node_count=node_count)
-
-            # 2.3 GraphMultiHeadAttention：捕捉全局拓扑依赖
-            # 注意力掩码：从node_feat的掩码推导（非0即非掩码，0为掩码）
-            # 掩码逻辑：节点特征中电压列（2、3列）为0 → 该节点需屏蔽注意力
-            mask = (node_feat[:, :, 2:4] == 0).any(dim=-1, keepdim=True)  # (B, N, 1)
-            global_feat = layer["gatt"](h=local_feat, mask=mask, node_count=node_count)
-
-            # 2.4 残差连接 + 层归一化
-            x = layer["norm"](residual + global_feat)
-
-        # 步骤3：预测完整节点特征（d_model→4）
-        pred_node = self.node_pred_head(x)
-
-        # 步骤4：屏蔽填充节点的预测结果（填充节点特征置0，避免干扰损失计算）
-        for b in range(pred_node.shape[0]):
-            real_node = node_count[b].item()
-            pred_node[b, real_node:, :] = 0.0
-
-        return pred_node
-
-
-def pretrain_loop(
-        model: GTransformerPretrain,
-        data_loader: DataLoader,
-        loss_fn: PhysicsInformedLoss,
-        optimizer: optim.Optimizer,
-        epochs: int = 50,
-        device: Optional[torch.device] = None,
-        save_path: str = "./pretrained_weights.pth"
-) -> None:
-    """
-    GTransformer自监督预训练循环（基于掩码电压预测任务）
-    核心逻辑：论文"物理知情自监督预训练"简化版，仅保留掩码特征预测（🔶1-23、🔶1-75）
-
-    Args:
-        model: GTransformerPretrain实例
-        data_loader: 数据加载器（返回带掩码的节点特征、真实标签等）
-        loss_fn: 物理知情损失函数（PhysicsInformedLoss实例）
-        optimizer: PyTorch优化器（默认Adam，lr=1e-3）
-        epochs: 预训练轮数（默认50，小数据集无需多轮）
-        device: 训练设备（自动检测cpu/cuda）
-        save_path: 预训练权重保存路径
-    """
-    # 1. 设备自动检测（优先级：用户指定 > 自动检测）
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    loss_fn.to(device)
-    print(f"=== 开始预训练 | 设备: {device} | 总轮次: {epochs} | 权重保存路径: {save_path} ===")
-
-    # 2. 预训练主循环
-    for epoch in range(1, epochs + 1):
-        model.train()  # 切换训练模式（启用dropout、BatchNorm等）
-        total_epoch_loss = 0.0
-        total_epoch_pred_loss = 0.0
-        total_epoch_physics_loss = 0.0
-
-        # 遍历DataLoader（带进度条）
-        with tqdm(data_loader, desc=f"Epoch {epoch}/{epochs}", unit="batch") as pbar:
-            for batch_idx, batch in enumerate(pbar, 1):
-                # 2.1 数据移至设备（修复线路数据处理）
-                node_feat = batch["node_matrix"].to(device)  # 带掩码的节点特征 (B, N, 4)
-                adj = batch["adj_matrix"].to(device)  # 邻接矩阵 (B, N, N)
-                gt_node = batch["node_matrix"].to(device)  # 真实节点特征（标签）(B, N, 4)
-                node_count = batch["scene_idx"].to(device)  # 修复：使用scene_idx获取真实节点数（或根据实际数据调整）
-
-                # 关键修复：处理线路数据（将批次张量转换为列表，移除填充部分）
-                line_matrix = batch["line_matrix"].to(device)  # 线路数据张量 (B, max_lines, 4)
-                gt_line = []  # 真实线路潮流列表（每个元素为(b_line, 4)）
-                line_param = []  # 线路参数列表（每个元素为(b_line, 4)）
-                for b in range(line_matrix.shape[0]):
-                    real_node = node_count[b].item()
-                    real_line = real_node - 1  # 辐射型网络：线路数 = 节点数 - 1
-                    gt_line.append(line_matrix[b, :real_line, :])  # 截取真实线路部分
-                    line_param.append(line_matrix[b, :real_line, :])
-
-                # 2.2 前向传播：预测完整节点特征
-                pred_node = model(node_feat=node_feat, adj=adj, node_count=node_count)
-
-                # 2.3 计算损失（论文"预测误差+物理约束"损失，🔶1-82）
-                # 简化处理：线路潮流预测暂用真实值（gt_line），仅优化节点特征预测
-                total_loss, pred_loss, physics_loss = loss_fn(
-                    pred_node=pred_node,
-                    gt_node=gt_node,
-                    pred_line=gt_line,  # 简化：用真实线路潮流替代预测（聚焦电压预测）
-                    gt_line=gt_line,
-                    adj=adj,
-                    line_param=line_param,
-                    node_count=node_count
-                )
-
-                # 2.4 反向传播与参数更新
-                optimizer.zero_grad()  # 清空梯度
-                total_loss.backward()  # 计算梯度
-                optimizer.step()  # 更新参数
-
-                # 2.5 累计损失（用于日志）
-                batch_size = node_feat.shape[0]
-                total_epoch_loss += total_loss.item() * batch_size
-                total_epoch_pred_loss += pred_loss.item() * batch_size
-                total_epoch_physics_loss += physics_loss.item() * batch_size
-
-                # 2.6 每10个Batch打印日志（🔶1-140中训练监控逻辑）
-                if batch_idx % 10 == 0:
-                    avg_loss = total_epoch_loss / (batch_idx * batch_size)
-                    avg_pred_loss = total_epoch_pred_loss / (batch_idx * batch_size)
-                    avg_physics_loss = total_epoch_physics_loss / (batch_idx * batch_size)
-                    pbar.set_postfix({
-                        "总损失": f"{avg_loss:.6f}",
-                        "预测损失": f"{avg_pred_loss:.6f}",
-                        "物理损失": f"{avg_physics_loss:.6f}"
-                    })
-
-        # 3. 每5轮保存一次模型权重（避免过拟合，便于中断后恢复）
-        if epoch % 5 == 0:
-            save_path_epoch = save_path.replace(".pth", f"_epoch{epoch}.pth")
-            torch.save(model.state_dict(), save_path_epoch)
-            print(f"✅ Epoch {epoch} 权重已保存至: {save_path_epoch}")
-
-    # 4. 预训练结束：保存最终权重
-    torch.save(model.state_dict(), save_path)
-    print(f"\n=== 预训练完成 | 最终权重保存至: {save_path} ===")
-    # 计算并打印最终平均损失
-    avg_final_loss = total_epoch_loss / len(data_loader.dataset)
-    avg_final_pred_loss = total_epoch_pred_loss / len(data_loader.dataset)
-    avg_final_physics_loss = total_epoch_physics_loss / len(data_loader.dataset)
-    print(
-        f"📊 最终平均损失：总损失={avg_final_loss:.6f}, 预测损失={avg_final_pred_loss:.6f}, 物理损失={avg_final_physics_loss:.6f}")
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=_collate_fn
+    )
