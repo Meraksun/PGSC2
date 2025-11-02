@@ -76,7 +76,7 @@ class DyMPNLayer(nn.Module):
             # -------------------------- 关键处理：截断无效填充节点 --------------------------
             # 遍历每个样本，将超出"真实节点数"的填充节点特征置0（避免填充值干扰计算）
             for batch_idx in range(h.shape[0]):
-                real_node_num = node_count[batch_idx].item()  # 当前样本的真实节点数
+                real_node_num = node_count[batch_idx].squeeze()  # 当前样本的真实节点数
                 # 填充节点索引：从real_node_num到N-1，将这些节点的特征置0
                 h[batch_idx, real_node_num:, :] = 0.0
 
