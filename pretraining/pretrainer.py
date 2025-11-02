@@ -149,8 +149,8 @@ def pretrain_loop(
                 node_feat = batch["node_matrix"].to(device)  # 带掩码的节点特征 (B, N, 4)
                 adj = batch["adj_matrix"].to(device)  # 邻接矩阵 (B, N, N)
                 gt_node = batch["node_matrix"].to(device)  # 真实节点特征（标签）(B, N, 4)
-                gt_line = batch["line_matrix"].to(device)  # 真实线路潮流（简化用，🔶1-88）
-                line_param = batch["line_matrix"].to(device)  # 线路参数 (B个元素，每个(b_line,4))
+                gt_line = [line.to(device) for line in batch["line_matrix"]]  # 遍历列表，逐个移动到设备
+                line_param = [line.to(device) for line in batch["line_matrix"]]  # 线路参数同样处理
                 node_count = batch["node_count"].to(device)  # 真实节点数 (B,)
 
                 # 2.2 前向传播：预测完整节点特征
