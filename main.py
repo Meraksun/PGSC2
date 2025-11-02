@@ -119,11 +119,20 @@ def load_data(args):
 
         # 推理模式：若指定scene_idx，单独加载该场景
         if args.mode == "infer" and args.scene_idx is not None:
-            # 加载指定场景（Sence_{scene_idx}.npy）
-            scene_file = f"{args.data_root}/Sence_{args.scene_idx}.npy"
+            # 加载指定场景（Sence_{scene_idx}.npz）
+            scene_file = f"{args.data_root}/Sence_{args.scene_idx}.npz"
             try:
                 data = np.load(scene_file, allow_pickle=False)
-                node_mat, line_mat, adj_mat = data[0], data[1], data[2]
+                # .npz 文件需要通过键名访问
+                if 'node' in data.files:
+                    node_mat, line_mat, adj_mat = data['node'], data['line'], data['adj']
+                elif 'arr_0' in data.files:
+                    node_mat, line_mat, adj_mat = data['arr_0'], data['arr_1'], data['arr_2']
+                elif len(data.files) >= 3:
+                    files = sorted(data.files)
+                    node_mat, line_mat, adj_mat = data[files[0]], data[files[1]], data[files[2]]
+                else:
+                    raise ValueError(f"无法从 {scene_file} 中提取3个数组，找到的文件键：{data.files}")
                 node_count = node_mat.shape[0]
                 # 生成掩码（同Dataset逻辑）
                 mask = generate_voltage_mask(
@@ -228,7 +237,8 @@ def run_pretrain(args, data_dict, device):
         optimizer=optimizer,
         epochs=pretrain_epochs,
         device=device,
-        save_path=args.pretrain_path
+        save_path=args.pretrain_path,
+        mask_ratio=args.mask_ratio
     )
     print("=== 预训练流程完成（权重已保存至：{args.pretrain_path}）===")
 

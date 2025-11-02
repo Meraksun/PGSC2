@@ -13,7 +13,7 @@ class SceneDataset(Dataset):
 
     def __init__(self, data_root: str):
         self.data_root = data_root
-        self.scene_files = [f for f in os.listdir(data_root) if f.startswith("Sence_") and f.endswith(".npy")]
+        self.scene_files = [f for f in os.listdir(data_root) if f.startswith("Sence_") and f.endswith(".npz")]
         self.scene_files.sort(key=lambda x: int(x.split("_")[1].split(".")[0]))  # 按场景编号排序
 
     def __len__(self) -> int:
@@ -24,7 +24,26 @@ class SceneDataset(Dataset):
         scene_file = self.scene_files[idx]
         scene_path = os.path.join(self.data_root, scene_file)
         data = np.load(scene_path, allow_pickle=False)
-        node_matrix, line_matrix, adj_matrix = data[0], data[1], data[2]
+        
+        # .npz 文件需要通过键名访问，尝试多种可能的键名
+        if 'node' in data.files:
+            # 如果使用命名键保存：node, line, adj
+            node_matrix = data['node']
+            line_matrix = data['line']
+            adj_matrix = data['adj']
+        elif 'arr_0' in data.files:
+            # 如果使用默认键保存：arr_0, arr_1, arr_2
+            node_matrix = data['arr_0']
+            line_matrix = data['arr_1']
+            adj_matrix = data['arr_2']
+        elif len(data.files) >= 3:
+            # 如果有多个文件，按字母顺序取前三个
+            files = sorted(data.files)
+            node_matrix = data[files[0]]
+            line_matrix = data[files[1]]
+            adj_matrix = data[files[2]]
+        else:
+            raise ValueError(f"无法从 {scene_file} 中提取3个数组，找到的文件键：{data.files}")
 
         # 转换为Tensor
         return {
@@ -65,6 +84,7 @@ def get_data_loader(
         for item in batch:
             a = item["node_matrix"].shape[0]  # 真实节点数（当前场景）
             b = item["line_matrix"].shape[0]
+            adj_shape = item["adj_matrix"].shape  # 邻接矩阵的实际形状
 
             # 节点矩阵填充
             node_pad = torch.zeros(max_nodes, 4, dtype=item["node_matrix"].dtype)
@@ -78,7 +98,9 @@ def get_data_loader(
 
             # 邻接矩阵填充
             adj_pad = torch.zeros(max_nodes, max_nodes, dtype=item["adj_matrix"].dtype)
-            adj_pad[:a, :a] = item["adj_matrix"]
+            # 使用实际邻接矩阵大小和节点矩阵大小的较小值，避免维度不匹配
+            adj_size = min(a, adj_shape[0], adj_shape[1])
+            adj_pad[:adj_size, :adj_size] = item["adj_matrix"][:adj_size, :adj_size]
             adj_matrix_batch.append(adj_pad)
 
             # 收集场景编号和真实节点数

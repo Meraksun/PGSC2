@@ -74,11 +74,16 @@ class DyMPNLayer(nn.Module):
             h = self.relu(aggregated)
 
             # -------------------------- 关键处理：截断无效填充节点 --------------------------
-            # 遍历每个样本，将超出"真实节点数"的填充节点特征置0（避免填充值干扰计算）
-            for batch_idx in range(h.shape[0]):
-                # 确保 real_node_num 是整数标量
-                real_node_num = int(node_count[batch_idx].item())  # 强制转换为 Python 整数
-                h[batch_idx, real_node_num:, :] = 0.0  # 现在索引操作有效
+            # 使用掩码操作避免原地修改（保护计算图）
+            # 构建掩码：对每个样本，真实节点数之后的位置为True（需要置0）
+            batch_size, max_nodes, d_model = h.shape
+            # 使用 torch.arange 构建索引，然后与 node_count 比较
+            node_indices = torch.arange(max_nodes, device=h.device).unsqueeze(0).expand(batch_size, -1)  # (B, N)
+            node_count_expanded = node_count.unsqueeze(1).expand(-1, max_nodes)  # (B, N)
+            pad_mask = node_indices >= node_count_expanded  # (B, N)，True表示填充节点
+            
+            # 使用 masked_fill 进行非原地操作
+            h = h.masked_fill(pad_mask.unsqueeze(-1), 0.0)
 
         # 返回动态消息传递后的节点特征（已捕捉局部拓扑关系）
         return h

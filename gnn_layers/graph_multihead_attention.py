@@ -102,15 +102,19 @@ class GraphMultiHeadAttention(nn.Module):
 
         # -------------------------- 步骤4：注意力掩码处理 --------------------------
         # 目标：屏蔽电压数据缺失的节点和无效填充节点，避免注意力聚焦于无效信息
-        batch_size, _, max_node, _ = score.shape
+        batch_size, n_heads, max_node, _ = score.shape
 
         # 1. 处理电压掩码（mask：B×N×2 → 转换为节点级掩码B×N）
         #    若节点的任意一列电压数据缺失（mask=1），则标记该节点为"需屏蔽"
-        node_mask = mask.any(dim=-1, keepdim=True)  # (B, N, 1)：1=需屏蔽节点，0=正常节点
+        node_mask = mask.any(dim=-1)  # (B, N)：1=需屏蔽节点，0=正常节点
         #    扩展为注意力掩码形状（B×1×N×N）：每个头共享同一掩码
         #    逻辑：若query节点i或key节点j需屏蔽，则score[i][j]设为-1e9（softmax后权重≈0）
-        attn_mask = node_mask.unsqueeze(1) | node_mask.unsqueeze(2)  # (B, 1, N, N)
-        attn_mask = attn_mask.to(dtype=score.dtype)  # 转换为与score同类型
+        #    使用广播：node_mask.unsqueeze(1).unsqueeze(-1) -> (B, 1, N, 1)
+        #             node_mask.unsqueeze(1).unsqueeze(2) -> (B, 1, 1, N)
+        #             | 操作会广播到 (B, 1, N, N)
+        node_mask_query = node_mask.unsqueeze(1).unsqueeze(-1)  # (B, 1, N, 1)
+        node_mask_key = node_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, N)
+        attn_mask = (node_mask_query | node_mask_key).bool()  # (B, 1, N, N)，转换为布尔类型
         #    掩码值替换：需屏蔽位置设为-1e9（softmax后趋近于0），正常位置设为0（不影响）
         score = score.masked_fill(attn_mask, -1e9)
 
