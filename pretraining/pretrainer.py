@@ -86,13 +86,9 @@ class GTransformerPretrain(nn.Module):
             local_feat = layer["dympn"](node_feat=x, adj=adj, node_count=node_count)
 
             # 2.3 GraphMultiHeadAttention：捕捉全局拓扑依赖
-            # 1. 生成布尔型掩码（显式转换）
-            mask = (node_feat[:, :, 2:4] == 0).any(dim=-1, keepdim=True).bool()  # (B, N, 1)，确保是bool类型
-            # 2. 扩展维度以匹配注意力分数的形状 (B, n_heads, N, N)
-            # 插入注意力头数维度（第1维），并重复适配节点数
-            mask = mask.unsqueeze(1)  # 形状变为 (B, 1, N, 1)
-            mask = mask.repeat(1, 1, 1, local_feat.size(1))  # 变为 (B, 1, N, N)，仍为bool类型
-            # 3. 传入注意力层
+            # 注意力掩码：从node_feat的掩码推导（非0即非掩码，0为掩码）
+            # 掩码逻辑：节点特征中电压列（2、3列）为0 → 该节点需屏蔽注意力
+            mask = (node_feat[:, :, 2:4] == 0).any(dim=-1, keepdim=True)  # (B, N, 1)
             global_feat = layer["gatt"](h=local_feat, mask=mask, node_count=node_count)
 
             # 2.4 残差连接 + 层归一化
@@ -148,14 +144,21 @@ def pretrain_loop(
         # 遍历DataLoader（带进度条）
         with tqdm(data_loader, desc=f"Epoch {epoch}/{epochs}", unit="batch") as pbar:
             for batch_idx, batch in enumerate(pbar, 1):
-                # 2.1 数据移至设备
-                # Batch键说明：来自data_loader.SceneDataset的__getitem__
+                # 2.1 数据移至设备（修复线路数据处理）
                 node_feat = batch["node_matrix"].to(device)  # 带掩码的节点特征 (B, N, 4)
                 adj = batch["adj_matrix"].to(device)  # 邻接矩阵 (B, N, N)
                 gt_node = batch["node_matrix"].to(device)  # 真实节点特征（标签）(B, N, 4)
-                gt_line = [line.to(device) for line in batch["line_matrix"]]  # 遍历列表，逐个移动到设备
-                line_param = [line.to(device) for line in batch["line_matrix"]]  # 线路参数同样处理
-                node_count = batch["node_count"].to(device)  # 真实节点数 (B,)
+                node_count = batch["scene_idx"].to(device)  # 修复：使用scene_idx获取真实节点数（或根据实际数据调整）
+
+                # 关键修复：处理线路数据（将批次张量转换为列表，移除填充部分）
+                line_matrix = batch["line_matrix"].to(device)  # 线路数据张量 (B, max_lines, 4)
+                gt_line = []  # 真实线路潮流列表（每个元素为(b_line, 4)）
+                line_param = []  # 线路参数列表（每个元素为(b_line, 4)）
+                for b in range(line_matrix.shape[0]):
+                    real_node = node_count[b].item()
+                    real_line = real_node - 1  # 辐射型网络：线路数 = 节点数 - 1
+                    gt_line.append(line_matrix[b, :real_line, :])  # 截取真实线路部分
+                    line_param.append(line_matrix[b, :real_line, :])
 
                 # 2.2 前向传播：预测完整节点特征
                 pred_node = model(node_feat=node_feat, adj=adj, node_count=node_count)
@@ -209,66 +212,3 @@ def pretrain_loop(
     avg_final_physics_loss = total_epoch_physics_loss / len(data_loader.dataset)
     print(
         f"📊 最终平均损失：总损失={avg_final_loss:.6f}, 预测损失={avg_final_pred_loss:.6f}, 物理损失={avg_final_physics_loss:.6f}")
-
-# -------------------------- 预训练启动示例（注释形式，取消注释可运行） --------------------------
-# if __name__ == "__main__":
-#     """
-#     示例：初始化数据集、模型、损失函数，启动预训练
-#     依赖模块：data_loader（SceneDataset、get_data_loader）、physics_informed_loss（PhysicsInformedLoss）
-#     """
-#     # 1. 导入依赖模块（需确保模块路径正确）
-#     from data_loader import SceneDataset, get_data_loader
-#
-#     # 2. 配置预训练参数
-#     PRETRAIN_CONFIG = {
-#         "data_root": "./Dataset",       # 数据集路径（用户已准备）
-#         "mask_ratio": 0.3,              # 电压掩码比例（论文默认0.3，🔶1-78）
-#         "batch_size": 8,                # Batch大小（适配小节点，避免GPU内存不足）
-#         "epochs": 50,                   # 预训练轮次
-#         "lr": 1e-3,                     # 学习率（Adam默认，🔶1-128）
-#         "save_path": "./pretrained_weights.pth",  # 权重保存路径
-#         "d_in": 4,                      # 输入特征维度
-#         "d_model": 64,                  # 嵌入维度
-#         "n_heads": 4,                   # 注意力头数
-#         "n_layers": 2                   # GTransformer层数
-#     }
-#
-#     # 3. 初始化数据集与DataLoader
-#     print("=== 加载数据集 ===")
-#     dataset = SceneDataset(
-#         data_root=PRETRAIN_CONFIG["data_root"],
-#         mask_ratio=PRETRAIN_CONFIG["mask_ratio"]
-#     )
-#     data_loader = get_data_loader(
-#         dataset=dataset,
-#         batch_size=PRETRAIN_CONFIG["batch_size"],
-#         shuffle=True,
-#         num_workers=2
-#     )
-#     print(f"数据集加载完成：共{len(dataset)}个场景，Batch大小={PRETRAIN_CONFIG['batch_size']}")
-#
-#     # 4. 初始化模型、损失函数、优化器
-#     print("\n=== 初始化模型与训练组件 ===")
-#     # 4.1 模型
-#     model = GTransformerPretrain(
-#         d_in=PRETRAIN_CONFIG["d_in"],
-#         d_model=PRETRAIN_CONFIG["d_model"],
-#         n_heads=PRETRAIN_CONFIG["n_heads"],
-#         n_layers=PRETRAIN_CONFIG["n_layers"]
-#     )
-#     # 4.2 物理知情损失函数（λ=0.5，平衡预测与物理约束）
-#     loss_fn = PhysicsInformedLoss(lambda_=0.5)
-#     # 4.3 优化器（Adam，论文中使用的优化器类型，🔶1-128）
-#     optimizer = optim.Adam(model.parameters(), lr=PRETRAIN_CONFIG["lr"])
-#     print(f"模型参数总数：{sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-#
-#     # 5. 启动预训练
-#     print("\n=== 启动预训练 ===")
-#     pretrain_loop(
-#         model=model,
-#         data_loader=data_loader,
-#         loss_fn=loss_fn,
-#         optimizer=optimizer,
-#         epochs=PRETRAIN_CONFIG["epochs"],
-#         save_path=PRETRAIN_CONFIG["save_path"]
-#     )
